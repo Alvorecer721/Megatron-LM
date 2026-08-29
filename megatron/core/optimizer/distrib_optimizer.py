@@ -6,6 +6,7 @@ import gc
 import itertools
 import logging
 from collections import ChainMap
+from copy import deepcopy
 from dataclasses import replace
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -822,6 +823,52 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         }
         return dtype_map.get(key, torch.float32)
 
+    def _can_reuse_precision_aware_checkpoint_state(self):
+        """Return whether the live TE optimizer state is a valid DCP load target.
+
+        Transformer Engine's precision-aware FusedAdam loader first lets PyTorch cast
+        every serialized state tensor to the parameter device, then replaces those
+        tensors with its final state representation. During distributed-checkpoint
+        loading that creates a full, short-lived CUDA optimizer-state copy.
+
+        FP32 moments and an FP32 master (or its BF16 remainder representation) do not
+        require an unscaled checkpoint tensor separate from the live optimizer state.
+        In that configuration we can initialize the final state directly and let DCP
+        overwrite it in place.
+        """
+        return (
+            self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+            and self.config.exp_avg_dtype == torch.float32
+            and self.config.exp_avg_sq_dtype == torch.float32
+            and self.config.main_params_dtype == torch.float32
+            and callable(self.init_state_fn)
+            and callable(getattr(self.optimizer, "get_unscaled_state", None))
+            and callable(getattr(self.optimizer, "set_scaled_state", None))
+        )
+
+    def _load_optimizer_param_groups_without_state(self, state_dict_param_groups):
+        """Restore optimizer group metadata without recasting live tensor state."""
+        current_groups = self.optimizer.param_groups
+        if len(current_groups) != len(state_dict_param_groups):
+            raise ValueError("loaded state dict has a different number of parameter groups")
+
+        restored_groups = []
+        for current_group, saved_group in zip(current_groups, state_dict_param_groups, strict=True):
+            if len(current_group["params"]) != len(saved_group["params"]):
+                raise ValueError(
+                    "loaded state dict contains a parameter group "
+                    "that doesn't match the size of optimizer's group"
+                )
+            restored_group = deepcopy(saved_group)
+            restored_group["params"] = current_group["params"]
+            if "param_names" in current_group and "param_names" not in restored_group:
+                restored_group["param_names"] = current_group["param_names"]
+            restored_groups.append(restored_group)
+
+        self.optimizer.__setstate__(
+            {"state": self.optimizer.state, "param_groups": restored_groups}
+        )
+
     def state_dict(self):
         """
         The state dict contains all non-DP-rank-dependent (i.e., non-parameter-
@@ -927,6 +974,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if len(self.optimizer.state) == 0:
             if isinstance(self.optimizer, HybridDeviceOptimizer):
                 self.optimizer.dummy_step()
+            elif self._can_reuse_precision_aware_checkpoint_state():
+                # Initialize TE's final optimizer representation directly. Calling
+                # FusedAdam.load_state_dict() here would first materialize a complete
+                # PyTorch-cast copy on CUDA and only then allocate this final state.
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    "Initializing precision-aware optimizer state directly as DCP load targets",
+                )
+                self.init_state_fn(self.optimizer, self.config)
 
         # Get the Torch optimizer's state dict.
         # - This 'inner' optimizer at this point is unallocated, and only
@@ -995,7 +1052,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             # Allocate dummy tensors.
                             numel = len(param_range_map["gbuf_world"])
                             init_shard = lambda dtype=torch.float32: torch.empty(
-                                (numel,), dtype=dtype, device=torch.cuda.current_device()
+                                (numel,), dtype=dtype, device="cpu"
                             )
 
                             # For precision_aware_optimizer, the empty tensors should also be
@@ -1042,10 +1099,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for v in self.optimizer.state.values():
                     v["step"] = step.detach().clone()
 
-        # Optimizer.
-        self.optimizer.load_state_dict(
-            {"state": state_dict_state, "param_groups": state_dict_param_groups}
-        )
+        # Optimizer. The precision-aware path above already owns the final CUDA
+        # tensors, and the distributed checkpoint loader overwrites those tensors in
+        # place. Restore only group metadata so TE does not rebuild the state through
+        # PyTorch's device-casting loader.
+        if self._can_reuse_precision_aware_checkpoint_state():
+            self._load_optimizer_param_groups_without_state(state_dict_param_groups)
+        else:
+            self.optimizer.load_state_dict(
+                {"state": state_dict_state, "param_groups": state_dict_param_groups}
+            )
 
         # Grad scaler.
         if 'grad_scaler' not in state_dict:

@@ -595,7 +595,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                                 opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
                                 opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
                             else:
-                                opt.initialize_state(p)
+                                opt.initialize_state(p, config.store_param_remainders)
 
         elif config.optimizer == 'lion':
             if not HAVE_EMERGING_OPTIMIZERS:
@@ -1246,5 +1246,12 @@ def get_megatron_optimizer(
         torch.distributed.checkpoint.save(
             state_dict=param_to_param_group, checkpoint_id=dump_param_to_param_group_map
         )
+
+    for model_chunk in model_chunks:
+        for param in model_chunk.parameters():
+            getter_fn = getattr(param, 'get_high_precision_init_val', None)
+            clearer_fn = getattr(param, 'clear_high_precision_init_val', None)
+            if getter_fn is not None and clearer_fn is not None and getter_fn() is not None:
+                clearer_fn()
 
     return ChainedOptimizer(optimizers)

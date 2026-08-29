@@ -155,10 +155,7 @@ class MambaMetadata:
 
         self.reset_varlen_metadata()
 
-        # Re-initialize the free slot pool
-        self.mamba_state_free_slots = torch.arange(
-            self.max_requests, dtype=torch.int32, device='cpu'
-        )
+        torch.arange(self.max_requests, out=self.mamba_state_free_slots)
         self.mamba_state_free_slot_count = self.max_requests
 
     def reset_varlen_metadata(self) -> None:
@@ -481,7 +478,7 @@ class MambaMetadata:
                 # - abs_positions=d_conv: conv gather reads tokens [0..d_conv-1].
                 #   These are within bounds only when the prefill has at least
                 #   d_conv tokens; shorter sequences (e.g. small CUDA-graph warmup
-                #   buckets) would overrun the token axis, so _ssm_prefill clamps
+                #   buckets) would overrun the token axis, so ssm_prefill clamps
                 #   the gather positions into range. The gathered state is unused.
                 if real_count < max_count:
                     self._intermediate_chunk_indices_buffer[real_count:max_count].fill_(0)
@@ -506,7 +503,7 @@ class MambaMetadata:
         else:
             # No extraction: fill with safe defaults for CUDA graph warmup
             # (same rationale as padding comment above; abs_positions=d_conv may
-            # exceed a sub-d_conv warmup sequence, so _ssm_prefill clamps the
+            # exceed a sub-d_conv warmup sequence, so ssm_prefill clamps the
             # gather positions into range and the gathered state is unused)
             self._intermediate_chunk_indices_buffer[:max_count] = 0
             self._intermediate_abs_positions_buffer[:max_count] = self.d_conv
@@ -750,7 +747,26 @@ class MambaMetadata:
         self.mamba_state_free_slot_count -= 1
         mamba_idx = self.mamba_state_free_slots[self.mamba_state_free_slot_count]
 
+        return int(mamba_idx)
+
+    def detach_state_slot(self, request_idx: int) -> int:
+        """Detach and return a request's live state slot without freeing it."""
+
+        mamba_idx = int(self.request_to_mamba_state_idx[request_idx].item())
+        if mamba_idx < 0:
+            raise RuntimeError(f"Request index {request_idx} has no live Mamba state slot")
+        self.request_to_mamba_state_idx[request_idx] = -1
         return mamba_idx
+
+    def free_slot(self, mamba_idx: int) -> None:
+        """Return one unbound slot to the live Mamba state pool."""
+
+        if not 0 <= mamba_idx < self.max_requests:
+            raise ValueError(f"Mamba state slot {mamba_idx} is outside the live state pool")
+        if self.mamba_state_free_slot_count >= self.max_requests:
+            raise RuntimeError("Cannot free a Mamba state slot when the pool is already full")
+        self.mamba_state_free_slots[self.mamba_state_free_slot_count] = mamba_idx
+        self.mamba_state_free_slot_count += 1
 
     def batch_allocate_slots(self, num_slots: int) -> Optional[torch.Tensor]:
         """
@@ -769,7 +785,19 @@ class MambaMetadata:
             self.mamba_state_free_slot_count : self.mamba_state_free_slot_count + num_slots
         ]
 
-        return mamba_idx
+        return mamba_idx.clone()
+
+    def _return_slots(self, mamba_indices: torch.Tensor) -> None:
+        """Return live state slots to the free-slot stack."""
+
+        if mamba_indices.numel() == 0:
+            return
+        start = self.mamba_state_free_slot_count
+        end = start + mamba_indices.numel()
+        if end > self.max_requests:
+            raise RuntimeError("Mamba state free-slot pool overflow")
+        self.mamba_state_free_slots[start:end] = mamba_indices.to(torch.int32)
+        self.mamba_state_free_slot_count = end
 
     def free_slots(self, request_indices: torch.Tensor) -> None:
         """
@@ -783,14 +811,7 @@ class MambaMetadata:
 
         # Filter out any invalid indices (e.g., -1)
         mamba_indices_to_free = mamba_indices_to_free[mamba_indices_to_free != -1]
-        num_to_free = len(mamba_indices_to_free)
-
-        if num_to_free > 0:
-            # Add the freed indices back to the free slot pool
-            start_idx = self.mamba_state_free_slot_count
-            end_idx = start_idx + num_to_free
-            self.mamba_state_free_slots[start_idx:end_idx] = mamba_indices_to_free
-            self.mamba_state_free_slot_count = end_idx
+        self._return_slots(mamba_indices_to_free)
 
         # Invalidate the Mamba state index for the finished requests
         self.request_to_mamba_state_idx[request_indices] = -1
