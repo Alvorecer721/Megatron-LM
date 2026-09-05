@@ -7,9 +7,9 @@ import torch
 
 from megatron.core import optimizer as optimizer_module
 from megatron.core.optimizer import distrib_optimizer
-from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
+from megatron.core.optimizer.optimizer_config import OptimizerConfig
 
 
 class _InnerOptimizer:
@@ -72,9 +72,7 @@ def test_load_state_dict_allocates_dummy_optimizer_state_on_cpu(monkeypatch):
     monkeypatch.setattr(
         torch.cuda,
         "current_device",
-        lambda: (_ for _ in ()).throw(
-            AssertionError("dummy state queried the CUDA device")
-        ),
+        lambda: (_ for _ in ()).throw(AssertionError("dummy state queried the CUDA device")),
     )
 
     model_param = object()
@@ -117,10 +115,7 @@ def test_precision_aware_init_state_passes_remainder_setting(monkeypatch):
     config = OptimizerConfig(optimizer="adam", lr=0.01)
     param = torch.nn.Parameter(torch.zeros(4, dtype=torch.bfloat16))
     optimizer, init_state_fn = optimizer_module._get_megatron_optimizer_based_on_param_groups(
-        config,
-        model_chunks=[],
-        param_groups=[{"params": [param]}],
-        skip_megatron_wrapping=True,
+        config, model_chunks=[], param_groups=[{"params": [param]}], skip_megatron_wrapping=True
     )
 
     config.use_precision_aware_optimizer = True
@@ -165,14 +160,10 @@ def test_load_state_dict_reuses_precision_aware_optimizer_state(monkeypatch):
         fp16=False,
     )
     distributed_optimizer.grad_scaler = None
-    checkpoint_state = {
-        "optimizer": {"param_groups": [{**identifier_fields, "lr": 0.25}]}
-    }
+    checkpoint_state = {"optimizer": {"param_groups": [{**identifier_fields, "lr": 0.25}]}}
 
     distributed_optimizer.load_state_dict(checkpoint_state)
-    second_checkpoint_state = {
-        "optimizer": {"param_groups": [{**identifier_fields, "lr": 0.125}]}
-    }
+    second_checkpoint_state = {"optimizer": {"param_groups": [{**identifier_fields, "lr": 0.125}]}}
     distributed_optimizer.load_state_dict(second_checkpoint_state)
 
     assert optimizer.load_state_dict_called is False

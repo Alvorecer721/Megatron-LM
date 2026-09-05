@@ -864,9 +864,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             raise ValueError("loaded state dict has a different number of parameter groups")
 
         restored_groups = []
-        for current_group, saved_group in zip(
-            current_groups, state_dict_param_groups, strict=True
-        ):
+        for current_group, saved_group in zip(current_groups, state_dict_param_groups, strict=True):
             if len(current_group["params"]) != len(saved_group["params"]):
                 raise ValueError(
                     "loaded state dict contains a parameter group "
