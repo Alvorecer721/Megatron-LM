@@ -3,8 +3,9 @@
 import logging
 import math
 import warnings
+from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Callable, List, Literal, Optional, Tuple, Union
+from typing import Callable, List, Literal, Optional, Self, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -83,6 +84,9 @@ class TransformerConfig(ModelParallelConfig):
 
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
+
+    freeze_base_model_for_mtp: bool = False
+    """Freeze every non-MTP parameter and avoid recording backbone activations."""
 
     mtp_detach_heads: bool = False
     """If True, detach MTP head inputs from the main model graph.
@@ -237,6 +241,14 @@ class TransformerConfig(ModelParallelConfig):
     activation_func_clamp_value: Optional[float] = None
     """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
     is quick_gelu or SwiGLU (MoE only)."""
+
+    activation_func_tanh_clamp_scale: Optional[float] = None
+    """If set, precondition the input of the activation function with `s * tanh(x / s)`, where `s`
+    is this value. For a gated activation (silu only) this instead selects SiTU-GLU."""
+
+    activation_func_tanh_clamp_scale_linear: Optional[float] = None
+    """Soft clamp scale for the linear (up) half of a gated activation, decoupled from the gate
+    scale in activation_func_tanh_clamp_scale. Requires activation_func_tanh_clamp_scale."""
 
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
@@ -1071,6 +1083,9 @@ class TransformerConfig(ModelParallelConfig):
     and P2P communications in high-level CP groups (e.g., via IBLink).
     """
 
+    linear_cp_mode: Literal["headwise", "chunkwise"] = "headwise"
+    """Context-parallel algorithm for recurrent and linear-attention layers."""
+
     linear_cp_layout: CPLayout = "zigzag"
     """CP layout for linear-attention layers."""
 
@@ -1363,7 +1378,8 @@ class TransformerConfig(ModelParallelConfig):
     stores one checkpoint per group of N+1 chunks (1/(N+1) the checkpoint memory) and the
     backward recomputes each group's N missing chunk states, trading recompute time for
     activation memory monotonically in N (sweet spot N=2..3). Only honored by kernel
-    builds that expose the num_chunk_states_to_recompute argument."""
+    builds that expose ``recompute_chunk_num`` or the legacy
+    ``num_chunk_states_to_recompute`` argument."""
 
     mlp_chunks_for_prefill: int = 1
     """The number of chunks along the sequence dimension to use for MLP computation
@@ -1460,18 +1476,28 @@ class TransformerConfig(ModelParallelConfig):
     insert these joins. This feature is particularly useful when using with full-iteration CUDA
     graphs"""
 
+    @classmethod
+    def from_config(cls, config: "TransformerConfig") -> Self:
+        """Create this config type from an existing normalized transformer config.
+
+        The source config's complete instance state is deep-copied without invoking
+        the target class's initializer or ``__post_init__``. This preserves normalized
+        values and dynamically added attributes while producing an independent config.
+
+        Args:
+            config: The transformer config to copy.
+
+        Returns:
+            An independent copy of ``config`` whose type is ``cls``.
+        """
+        new_config = cls.__new__(cls)
+        new_config.__dict__ = deepcopy(config.__dict__, {id(config): new_config})
+        return new_config
+
     def _validate_cp_layouts(self) -> None:
         """Validate context-parallel layout settings."""
-        if self.linear_cp_layout not in ("contiguous", "zigzag"):
-            raise ValueError(
-                "linear_cp_layout must be either 'contiguous' or 'zigzag', "
-                f"got {self.linear_cp_layout!r}"
-            )
-        if self.attention_cp_layout not in ("contiguous", "zigzag"):
-            raise ValueError(
-                "attention_cp_layout must be either 'contiguous' or 'zigzag', "
-                f"got {self.attention_cp_layout!r}"
-            )
+        if self.linear_cp_mode == "chunkwise" and self.linear_cp_layout != "contiguous":
+            raise ValueError("linear_cp_mode='chunkwise' requires linear_cp_layout='contiguous'.")
         if self.context_parallel_size > 1 and self.attention_cp_layout == "contiguous":
             raise ValueError(
                 "attention_cp_layout='contiguous' is not yet supported with context parallelism."
@@ -1479,6 +1505,14 @@ class TransformerConfig(ModelParallelConfig):
         if self.linear_cp_layout == "contiguous" and self.hybrid_context_parallel:
             raise ValueError(
                 "hybrid_context_parallel is not supported with linear_cp_layout='contiguous'."
+            )
+        if (
+            self.sequence_packing_scheduler is not None
+            and self.context_parallel_size > 1
+            and self.linear_cp_layout != self.attention_cp_layout
+        ):
+            raise ValueError(
+                "The sequence-packing scheduler does not support CP layout conversion."
             )
         if (
             self.context_parallel_size > 1
@@ -1490,14 +1524,6 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "Sequence-parallel CP layout conversion requires an even "
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
-            )
-        if (
-            self.linear_cp_layout == "contiguous"
-            and self.context_parallel_size > 1
-            and (self.mtp_num_layers or 0) > 0
-        ):
-            raise ValueError(
-                "linear_cp_layout='contiguous' with context parallelism does not yet support MTP."
             )
 
     def __post_init__(self):
@@ -1571,6 +1597,12 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.num_query_groups is None:
             self.num_query_groups = self.num_attention_heads
+
+        if self.num_query_groups > 0 and self.num_attention_heads % self.num_query_groups != 0:
+            raise ValueError(
+                f"num_query_groups ({self.num_query_groups}) must be a divisor of "
+                f"num_attention_heads ({self.num_attention_heads})."
+            )
 
         if (
             self.num_query_groups % self.tensor_model_parallel_size != 0
@@ -2609,6 +2641,53 @@ class TransformerConfig(ModelParallelConfig):
                     "use_te_activation_func to False"
                 )
 
+        if self.activation_func_tanh_clamp_scale is not None:
+            if self.activation_func_tanh_clamp_scale <= 0.0:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale must be positive, got "
+                    f"{self.activation_func_tanh_clamp_scale}."
+                )
+            if self.use_te_activation_func:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale is not supported with "
+                    "use_te_activation_func, since the TE activation modules cannot clamp."
+                )
+            if self.gated_linear_unit and self.activation_func != F.silu:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale with a gated activation is implemented as "
+                    "SiTU-GLU, which replaces the swish gate, so it requires silu."
+                )
+            if self.bias_activation_fusion and not (
+                self.activation_func == F.silu and self.gated_linear_unit
+            ):
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale with bias_activation_fusion is only "
+                    "implemented for SwiGLU. The fused gelu, geglu and quick_geglu kernels do not "
+                    "apply the clamp, so set bias_activation_fusion to False."
+                )
+            if self.activation_func_clamp_value is not None:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale and activation_func_clamp_value both clamp "
+                    "the activation input; set only one of them."
+                )
+
+        if self.activation_func_tanh_clamp_scale_linear is not None:
+            if self.activation_func_tanh_clamp_scale_linear <= 0.0:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale_linear must be positive, got "
+                    f"{self.activation_func_tanh_clamp_scale_linear}."
+                )
+            if self.activation_func_tanh_clamp_scale is None:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale_linear only clamps the linear half of "
+                    "SiTU-GLU, so it requires activation_func_tanh_clamp_scale for the gate half. "
+                    "Clamping the linear half alone would leave the gate unbounded."
+                )
+            if not self.gated_linear_unit:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale_linear requires gated_linear_unit."
+                )
+
         if self.activation_func_fp8_input_store:
             if self.activation_func != F.silu or not self.gated_linear_unit:
                 raise ValueError("Storing activation input in FP8 is supported only for SwiGLU.")
@@ -3461,6 +3540,11 @@ class MLATransformerConfig(TransformerConfig):
     multi_latent_attention: bool = True
     """Whether to use Multi-Latent Attention."""
 
+    use_fused_mla_q_uproj: bool = False
+    """Use the cuDNN fused MLA Q up-proj + per-head RoPE + MXFP8-quant kernel (SM100 only).
+    Requires apply_rope_fusion=True, q_lora_rank set, TP=1, SBHD, MXFP8 DPA, and zero
+    attention dropout."""
+
     q_lora_rank: int = 512
     """Rank of Query tensor's low rank representation."""
 
@@ -3520,6 +3604,19 @@ class MLATransformerConfig(TransformerConfig):
         super().__post_init__()
         if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
+
+        if self.use_fused_mla_q_uproj and (
+            self.fp8 is None
+            or self.fp8_recipe != Fp8Recipe.mxfp8
+            or not self.fp8_dot_product_attention
+            or self.attention_dropout != 0.0
+        ):
+            raise ValueError(
+                "use_fused_mla_q_uproj requires FP8 with fp8_recipe='mxfp8' and "
+                "fp8_dot_product_attention=True so TE interprets the pre-quantized Q/K/V "
+                "scale layout correctly, plus attention_dropout=0.0 because MXFP8 attention "
+                "backward does not support dropout."
+            )
 
         if self.attention_output_gate:
             raise NotImplementedError("Output gate is not supported for MLA yet.")
