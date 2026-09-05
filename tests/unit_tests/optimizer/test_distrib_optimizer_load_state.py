@@ -3,6 +3,7 @@
 from collections import defaultdict
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from megatron.core import optimizer as optimizer_module
@@ -107,22 +108,34 @@ def test_load_state_dict_allocates_dummy_optimizer_state_on_cpu(monkeypatch):
     assert all(tensor.shape == (4,) for tensor in loaded_state.values())
 
 
-def test_precision_aware_init_state_passes_remainder_setting(monkeypatch):
-    """The initializer must honor the TE 2.15 two-argument API."""
+@pytest.mark.parametrize(
+    ("param_dtype", "optimizer_store_param_remainders", "expected_store_param_remainders"),
+    [
+        (torch.bfloat16, True, True),
+        (torch.float32, True, False),
+        (torch.float16, True, False),
+        (torch.bfloat16, False, False),
+    ],
+)
+def test_precision_aware_init_state_uses_effective_remainder_setting(
+    monkeypatch, param_dtype, optimizer_store_param_remainders, expected_store_param_remainders
+):
+    """Only BF16 parameters use remainders when enabled by the TE optimizer."""
     monkeypatch.setattr(optimizer_module, "USING_PYTORCH_OPTIMIZER", False)
     monkeypatch.setattr(optimizer_module, "Adam", _PrecisionAwareAdamStub)
 
     config = OptimizerConfig(optimizer="adam", lr=0.01)
-    param = torch.nn.Parameter(torch.zeros(4, dtype=torch.bfloat16))
+    param = torch.nn.Parameter(torch.zeros(4, dtype=param_dtype))
     optimizer, init_state_fn = optimizer_module._get_megatron_optimizer_based_on_param_groups(
         config, model_chunks=[], param_groups=[{"params": [param]}], skip_megatron_wrapping=True
     )
 
+    optimizer.store_param_remainders = optimizer_store_param_remainders
     config.use_precision_aware_optimizer = True
     config.store_param_remainders = True
     init_state_fn(optimizer, config)
 
-    assert optimizer.initialize_state_calls == [(param, True)]
+    assert optimizer.initialize_state_calls == [(param, expected_store_param_remainders)]
 
 
 def test_load_state_dict_reuses_precision_aware_optimizer_state(monkeypatch):
