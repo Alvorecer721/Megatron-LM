@@ -76,6 +76,14 @@ from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end,
 logger = getLogger(__name__)
 
 
+def _has_no_optimizer_load_state_dict_hooks(optimizer):
+    """Fail closed if PyTorch changes its private load-hook registries."""
+    pre_hooks = getattr(optimizer, "_optimizer_load_state_dict_pre_hooks", None)
+    post_hooks = getattr(optimizer, "_optimizer_load_state_dict_post_hooks", None)
+    return pre_hooks is not None and post_hooks is not None and not pre_hooks and not post_hooks
+
+
+
 class Range:
     """
     A range represents a start and end points for indexing a shard
@@ -835,50 +843,45 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return dtype_map.get(key, torch.float32)
 
     def _can_reuse_precision_aware_checkpoint_state(self):
-        """Return whether the live TE optimizer state is a valid DCP load target.
+        """Whether the inner TE loader can be skipped without converting tensor state.
 
-        Transformer Engine's precision-aware FusedAdam loader first lets PyTorch cast
-        every serialized state tensor to the parameter device, then replaces those
-        tensors with its final state representation. During distributed-checkpoint
-        loading that creates a full, short-lived CUDA optimizer-state copy.
-
-        FP32 moments and an FP32 master (or its BF16 remainder representation) do not
-        require an unscaled checkpoint tensor separate from the live optimizer state.
-        In that configuration we can initialize the final state directly and let DCP
-        overwrite it in place.
+        FP32 moments and masters (or raw int16 BF16 master remainders) need no
+        conversion. Require both the configured and actual optimizer representation.
+        Quantized primary parameters, custom subclasses, and load hooks retain the public loader.
+        Format-specific parameter-state restoration still runs in load_state_dict().
         """
         return (
-            self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+            USING_TE_OPTIMIZER
+            # Subclasses may depend on their own load_state_dict implementation.
+            and type(self.optimizer) is Adam
+            and self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
             and self.config.exp_avg_dtype == torch.float32
             and self.config.exp_avg_sq_dtype == torch.float32
             and self.config.main_params_dtype == torch.float32
+            and getattr(self.optimizer, "master_weights", False)
+            and getattr(self.optimizer, "exp_avg_dtype", None) == torch.float32
+            and getattr(self.optimizer, "exp_avg_sq_dtype", None) == torch.float32
+            and getattr(self.optimizer, "master_weight_dtype", None) == torch.float32
             and callable(self.init_state_fn)
-            and callable(getattr(self.optimizer, "get_unscaled_state", None))
-            and callable(getattr(self.optimizer, "set_scaled_state", None))
+            and _has_no_optimizer_load_state_dict_hooks(self.optimizer)
+            # The CLI defaults to a delayed FP8 recipe even for BF16 training.
+            # Check actual primary storage instead of excluding that recipe.
+            and not any(
+                self._is_distopt_quantized_param(param) or is_nvfp4tensor(param)
+                for param in self.model_param_group_index_map
+            )
         )
 
     def _load_optimizer_param_groups_without_state(self, state_dict_param_groups):
-        """Restore optimizer group metadata without recasting live tensor state."""
-        current_groups = self.optimizer.param_groups
-        if len(current_groups) != len(state_dict_param_groups):
-            raise ValueError("loaded state dict has a different number of parameter groups")
-
-        restored_groups = []
-        for current_group, saved_group in zip(current_groups, state_dict_param_groups, strict=True):
-            if len(current_group["params"]) != len(saved_group["params"]):
-                raise ValueError(
-                    "loaded state dict contains a parameter group "
-                    "that doesn't match the size of optimizer's group"
-                )
-            restored_group = deepcopy(saved_group)
+        """Restore already matched group metadata without recasting live TE state."""
+        restored_groups = deepcopy(state_dict_param_groups)
+        for current_group, restored_group in zip(
+            self.optimizer.param_groups, restored_groups, strict=True
+        ):
             restored_group["params"] = current_group["params"]
             if "param_names" in current_group and "param_names" not in restored_group:
                 restored_group["param_names"] = current_group["param_names"]
-            restored_groups.append(restored_group)
-
-        self.optimizer.__setstate__(
-            {"state": self.optimizer.state, "param_groups": restored_groups}
-        )
+        self.optimizer.param_groups = restored_groups
 
     def state_dict(self):
         """
@@ -945,19 +948,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def load_state_dict(self, state_dict):
         """Load the state dict.
 
-        As detailed in state_dict(), the state dict contains all non-
-        parameter-related variables. This method is notably longer than
-        state_dict(), because the Torch optimizers state has yet to be
-        allocated at this point, and so we must do a cross referencing between
-        the optimizers state (and the ordering it expects for parameter state)
-        and this DP rank's shards. The optimizer at this point does not contain
-        any tensor dimension information, so we must get these dimensions from
-        the DP shards mapped during DistributedOptimizer.__init__().
+        Checkpoint loading can call this twice: first while constructing sharded
+        targets, then after DCP has read the checkpoint. Eligible precision-aware
+        TE optimizers allocate their final tensor state once and restore only group
+        metadata here, bypassing redundant reconstruction by the inner loader.
+        Other optimizers retain the public loader and, when needed, placeholders
+        sized from the DP shards mapped by DistributedOptimizer.__init__().
 
-        The tensor parameter state is loaded via load_parameter_state(), and
-        so this method also must populate the loaded state dict with dummy
-        tensor data (i.e., via torch.empty() below). This will be overwritten
-        during load_parameter_state().
+        Parameter-state restoration remains format-specific. dp_reshardable targets
+        can alias live TE state; fully_reshardable instead loads intermediate CPU
+        buffers and copies their slices through its parameter-state loader. Those
+        loaders still run below, or separately through load_parameter_state().
 
         ** Note: Torch optimizer's state structure. **
         The Torch optimizer stores its state in two levels. The top level is a
@@ -2974,6 +2975,29 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             model_chunk.zero_grad_buffer()
         self._copy_main_params_to_param_buffer()
+
+    @torch.no_grad()
+    def _stage_model_params_from_main_params(self) -> None:
+        if self.is_stub_optimizer:
+            return
+        if self.config.reuse_grad_buf_for_mxfp8_param_ag:
+            # MXFP8 reuses the grad buffer for the param all-gather; the quantization
+            # happens after the all-gather, in _post_param_sync.
+            self._copy_main_params_to_param_buffer()
+        else:
+            self._copy_main_params_to_model_params()
+
+    @torch.no_grad()
+    def quantize_and_sync_model_params_from_main_params(self) -> None:
+        """Re-derive and all-gather the model params (see MegatronOptimizer)."""
+        if self.is_stub_optimizer:
+            return
+        self._stage_model_params_from_main_params()
+        # Each rank only owns a shard of the main params, so the full params have to be
+        # gathered. The caller is outside the training loop, so gather synchronously
+        # instead of relying on the next step's overlapped gather.
+        for model_chunk in self.model_chunks:
+            model_chunk.start_param_sync(force_sync=True)
 
     def _copy_main_params_to_param_buffer(self):
         """
